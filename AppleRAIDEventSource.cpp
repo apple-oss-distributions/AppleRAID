@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2002 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2001-2005 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -19,18 +19,14 @@
  *
  * @APPLE_LICENSE_HEADER_END@
  */
-/*
- *  DRI: Josh de Cesare
- *
- */
 
-#include "AppleRAIDEventSource.h"
+#include "AppleRAID.h"
 
 #undef super
 #define super IOEventSource
 OSDefineMetaClassAndStructors(AppleRAIDEventSource, IOEventSource);
 
-AppleRAIDEventSource *AppleRAIDEventSource::withAppleRAIDSet(AppleRAID *appleRAID, Action action)
+AppleRAIDEventSource *AppleRAIDEventSource::withAppleRAIDSet(AppleRAIDSet *appleRAID, Action action)
 {
     AppleRAIDEventSource *eventSource = new AppleRAIDEventSource;
     
@@ -44,7 +40,7 @@ AppleRAIDEventSource *AppleRAIDEventSource::withAppleRAIDSet(AppleRAID *appleRAI
     return eventSource;
 }
 
-bool AppleRAIDEventSource::initWithAppleRAIDSet(AppleRAID *appleRAID, Action action)
+bool AppleRAIDEventSource::initWithAppleRAIDSet(AppleRAIDSet *appleRAID, Action action)
 {
     if (!super::init(appleRAID, (IOEventSource::Action)action)) return false;
     
@@ -53,22 +49,22 @@ bool AppleRAIDEventSource::initWithAppleRAIDSet(AppleRAID *appleRAID, Action act
     return true;
 }
 
-void AppleRAIDEventSource::sliceCompleteRequest(AppleRAIDMemoryDescriptor *memoryDescriptor,
+void AppleRAIDEventSource::memberCompleteRequest(AppleRAIDMemoryDescriptor *memoryDescriptor,
                                                 IOReturn status, UInt64 actualByteCount)
 {
-    UInt32			sliceNumber = memoryDescriptor->mdSliceNumber;
+    UInt32			memberIndex = memoryDescriptor->mdMemberIndex;
     AppleRAIDStorageRequest	*storageRequest = memoryDescriptor->mdStorageRequest;
     
     closeGate();
-    
-    // Count the slice as completed.
+
+    // Count the member as completed.
     storageRequest->srCompletedCount++;
     
-    // Save the slices results.
-    storageRequest->srSliceStatus[sliceNumber] = status;
-    storageRequest->srSliceByteCounts[sliceNumber] = actualByteCount;
+    // Save the members results.
+    storageRequest->srMemberStatus[memberIndex] = status;
+    storageRequest->srMemberByteCounts[memberIndex] = actualByteCount;
     
-    if (storageRequest->srCompletedCount == storageRequest->srSliceCount) {
+    if (storageRequest->srCompletedCount == storageRequest->srMemberCount) {
         queue_enter(&fCompletedHead, storageRequest, AppleRAIDStorageRequest *, fCommandChain);
         
 	signalWorkAvailable();
@@ -77,39 +73,15 @@ void AppleRAIDEventSource::sliceCompleteRequest(AppleRAIDMemoryDescriptor *memor
     openGate();
 }
 
-void AppleRAIDEventSource::terminateRAIDMedia(IOMedia *media)
-{
-    closeGate();
-    
-    while (doTerminateRAIDMedia != 0) {
-        sleepGate(&doTerminateRAIDMedia, THREAD_UNINT);
-    }
-    
-    doTerminateRAIDMedia = media;
-    doTerminateRAIDMedia->retain();
-    
-    signalWorkAvailable();
-    
-    openGate();
-}
-
 bool AppleRAIDEventSource::checkForWork(void)
 {
-    AppleRAID			*appleRAID = (AppleRAID *)owner;
+    AppleRAIDSet	        *appleRAID = (AppleRAIDSet *)owner;
     AppleRAIDStorageRequest 	*storageRequest;
     
-    if (doTerminateRAIDMedia != 0) {
-        appleRAID->terminateRAIDMedia(doTerminateRAIDMedia);
-        doTerminateRAIDMedia->release();
-        
-        doTerminateRAIDMedia = 0;
-        wakeupGate(&doTerminateRAIDMedia, true);
-    }
-    
     if (!queue_empty(&fCompletedHead)) {
-      queue_remove_first(&fCompletedHead, storageRequest, AppleRAIDStorageRequest *, fCommandChain);
+	queue_remove_first(&fCompletedHead, storageRequest, AppleRAIDStorageRequest *, fCommandChain);
       
-      (*(Action)action)(appleRAID, storageRequest);
+	(*(Action)action)(appleRAID, storageRequest);
     }
     
     return !queue_empty(&fCompletedHead);
@@ -117,5 +89,5 @@ bool AppleRAIDEventSource::checkForWork(void)
 
 IOStorageCompletionAction AppleRAIDEventSource::getStorageCompletionAction(void)
 {
-    return (IOStorageCompletionAction)&AppleRAIDEventSource::sliceCompleteRequest;
+    return (IOStorageCompletionAction)&AppleRAIDEventSource::memberCompleteRequest;
 }

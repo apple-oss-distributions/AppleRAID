@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2002 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2001-2005 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -19,15 +19,11 @@
  *
  * @APPLE_LICENSE_HEADER_END@
  */
-/*
- *  DRI: Josh de Cesare
- *
- */
 
 #ifndef _APPLERAIDEVENTSOURCE_H
 #define _APPLERAIDEVENTSOURCE_H
 
-#include "AppleRAID.h"
+class AppleRAIDSet;
 
 class AppleRAIDEventSource : public IOEventSource
 {
@@ -35,22 +31,17 @@ class AppleRAIDEventSource : public IOEventSource
     
     friend class AppleRAIDStorageRequest;
     
-private:
-    IOMedia	*doTerminateRAIDMedia;
-    
 protected:
     queue_head_t fCompletedHead;
     
     virtual bool checkForWork(void);
-    virtual void sliceCompleteRequest(AppleRAIDMemoryDescriptor *memoryDescriptor,
+    virtual void memberCompleteRequest(AppleRAIDMemoryDescriptor *memoryDescriptor,
                                       IOReturn status, UInt64 actualByteCount);
     
 public:
-    typedef void (*Action)(AppleRAID *appleRAID, AppleRAIDStorageRequest *storageRequest);
-    static AppleRAIDEventSource *withAppleRAIDSet(AppleRAID *appleRAID, Action action);
-    virtual bool initWithAppleRAIDSet(AppleRAID *appleRAID, Action action);
-    
-    virtual void terminateRAIDMedia(IOMedia *media);
+    typedef void (*Action)(AppleRAIDSet *appleRAID, AppleRAIDStorageRequest *storageRequest);
+    static AppleRAIDEventSource *withAppleRAIDSet(AppleRAIDSet *appleRAID, Action action);
+    virtual bool initWithAppleRAIDSet(AppleRAIDSet *appleRAID, Action action);
     
     virtual IOStorageCompletionAction getStorageCompletionAction(void);
 };

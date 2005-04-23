@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2002 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2001-2005 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -19,36 +19,28 @@
  *
  * @APPLE_LICENSE_HEADER_END@
  */
-/*
- *  DRI: Josh de Cesare
- *
- */
 
 
 #ifndef _APPLERAIDGLOBALS_H
 #define _APPLERAIDGLOBALS_H
 
-#include "AppleRAID.h"
-#include "AppleRAIDController.h"
-
 class AppleRAIDGlobals
 {
 private:
-    OSDictionary	*_raidSets;
-    IOLock		*_raidSetsLock;
-    AppleRAIDController	*_raidController;
+    IORecursiveLock *     raidGlobalLock;
+    AppleRAID *		  raidController;
+    UInt32		  raidControllerReferences;
     
 public:
     AppleRAIDGlobals();
     ~AppleRAIDGlobals();
-    bool isValid(void);
     void lock(void);
     void unlock(void);
-    AppleRAID *getAppleRAIDSet(const OSSymbol *raidSetName);
-    void setAppleRAIDSet(const OSSymbol *raidSetName, AppleRAID *appleRAID);
-    void removeAppleRAIDSet(const OSSymbol *raidSetName);
-    AppleRAIDController *getAppleRAIDController(void);
-    void removeAppleRAIDController(void);
+    bool islocked(void);
+
+    AppleRAID * getController(void);
+    void releaseController(void);
+    
 };
 
 extern AppleRAIDGlobals gAppleRAIDGlobals;

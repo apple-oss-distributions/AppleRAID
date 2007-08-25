@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2005 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2001-2007 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -35,26 +35,24 @@
 #include <IOKit/IOCFUnserialize.h>
 #include <IOKit/IOMessage.h>
 
-#include <MediaKit/legacy/Misc.h>
-#include <MediaKit/legacy/MediaDevice.h>
-#include <MediaKit/legacy/MediaErrors.h>
-#include <MediaKit/legacy/PartitionsII.h>
-#include <MediaKit/legacy/UnixIO.h>
-#include <MediaKit/legacy/StartupFile.h>
-#include <MediaKit/legacy/Checksums.h>
-#include <MediaKit/legacy/MediaLayout.h>
+#include <MediaKit/MKMedia.h>
+#include <MediaKit/MKMediaAccess.h>
 
 #include "AppleRAIDUserLib.h"
+#include "AppleRAIDMember.h"   // for V2 header
 
 #define AUTO_YES	1
 #define AUTO_NO		2
 
-static int autoRebuild = 0;
-static char * hint = 0;
-static UInt64 blockSize = 0;
-static UInt64 timeout = 0;
-static bool verbose = false;
-static char * volName = 0;
+static int		autoRebuild = 0;
+static UInt64		blockSize = 0;
+static bool		extents = false;
+static char *		hint = 0;
+static char *		nickname = 0;
+static int		quickRebuild = 0;
+static UInt64		timeout = 0;
+static bool		verbose = false;
+static UInt64		volSize = 0;
 
 static void
 usage()
@@ -62,23 +60,35 @@ usage()
     printf("\n");
     printf("usage:\n");
     printf("\n");
-    printf("artest --list\n\n");
+    printf("artest --list\n");
+    printf("artest --lvlist [--extents] <lv uuid | lvg uuid>\n");
     printf("\n");
-    printf("artest --create --name <volname> --level <level> <options> disk1s3 disk2s3 disk3s3 ...\n");
-    printf("artest --destroy <set uuid>\n\n");
-    printf("artest --modify <set uuid> <options>\n");
+    printf("artest --create --name <nickname> --level <level> <options> disk1s3 disk2s3 disk3s3 ...\n");
+    printf("artest --destroy <set uuid>\n");
     printf("\n");
     printf("artest --add <set uuid> disk1s3 ...\n");
     printf("artest --spare <set uuid> disk1s3 ...\n");
-    printf("artest --remove <set uuid> disk1s3 ...\n");
+    printf("artest --remove <set uuid> <member uuid> ...\n");
+    printf("artest --modify <set uuid> <options>\n");
     printf("\n");
-    printf("artest --erase disk1s3 disk2s3 disk3s3 ...\n\n");
+    printf("artest --lvcreate <lvg uuid> <lvoptions>\n");
+    printf("artest --lvdestroy <lv uuid>\n");
+    printf("\n");
+    printf("artest --lvmodify <lv uuid> <lvoptions>\n");
+    printf("artest --lvresize <lv uuid> [--size <number>]\n");
+    printf("artest --lvsnap <lv uuid> [--size <number>] --level=\"snap ro\"|\"snap rw\">\n");
+    printf("\n");
+    printf("artest --erase disk1s3 disk2s3 disk3s3 ...\n");
+    printf("artest --header disk1s3 disk2s3 disk3s3 ...\n");
     printf("\n");
     printf("parameters:\n");
-    printf("	<volname> = \"the volume name\"\n");
-    printf("	<level> = stripe, mirror, concat\n");
-    printf("	<options> = [--auto-rebuild=Yes] [--block-size=0x8000] [--hint=\"hint string\"] [--timeout=30]\n");
-    printf("	<set uuid> = XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX\n");
+    printf("	<uuid> = XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX\n");
+    printf("	<nickname> = \"the volume name\"\n");
+    printf("	<level> = stripe, mirror, concat, lvg\n");
+    printf("	<hint> = Apple_HFS, RAIDNoMedia, RAIDNoFS\n");
+    printf("	<options> = [--auto-rebuild=Yes,No] [--block-size=0x8000] [--hint=<hint>]\n");
+    printf("	<options> = [--name=<nickname>] [--timeout=30] [--quick-rebuild=Yes]\n");
+    printf("	<lvoptions> = [--level=concat] [--hint=<hint>] [--name=<nickname>] [--size 0xXXXXXXXXXXXXXXXX]\n");
     printf("\n");
     printf("global options:\n");
     printf("	--verbose\n");
@@ -88,7 +98,8 @@ usage()
 
 // there must be something like this already?
 
-void CFPrintf(CFStringRef format, ...)
+static void
+CFPrintf(CFStringRef format, ...)
 {
     CFStringRef cfstring;
     va_list argList;
@@ -100,9 +111,10 @@ void CFPrintf(CFStringRef format, ...)
     CFIndex cfstringSize = CFStringGetLength(cfstring);
     CFIndex stringSize = CFStringGetMaximumSizeForEncoding(cfstringSize, kCFStringEncodingUTF8) + 1;
     char *string = malloc(stringSize);
-    if (CFStringGetCString(cfstring, string, stringSize, kCFStringEncodingUTF8));
-
-    printf("%s", string);
+    if (CFStringGetCString(cfstring, string, stringSize, kCFStringEncodingUTF8)) {
+	printf("%s", string);
+    }
+    free(string);
 }
 
 
@@ -126,41 +138,76 @@ switchPartition(char * diskName, char * partitionType)
 	*c = 0;						// clip off remainder
 	sscanf(c+1, "%u", &partitionNumber);		// get partition number
     }
-    if (!partitionNumber) return true;			// just assume it a raid disk
+    if (!partitionNumber) return true;			// just assume it is a raid disk
+
+#ifdef LIVERAID
+    char * optionString = "<dict> <key>Writable</key> <true/> <key>Shared Writer</key> <true/></dict>";
+#else
+    char * optionString = "<dict> <key>Writable</key> <true/> </dict>";
+#endif    
+    CFDictionaryRef options = IOCFUnserialize(optionString, kCFAllocatorDefault, 0, NULL);
+    if (!options) exit(1);
+
+    int32_t err;
+    MKMediaRef device = MKMediaCreateWithPath(nil, wholeDevicePath, options, &err);
+    CFRelease(options);
+    if (!device || err) return false;
     
-    MediaDescriptor * mediaDescriptor;
-    int err = MKMediaDeviceOpen(wholeDevicePath, O_RDWR, &mediaDescriptor);
-    if (err) return false;
-    
-    PartitionsHdl partitions = NULL;
-    err = VReadPartitions(&partitions, PMROptions, mediaDescriptor, MKMediaDeviceIO);
-    if (err) return false;
+    options = NULL;
+    MKStatus err2;
+    CFMutableDictionaryRef media = MKCFReadMedia(options, device, &err2);
+    if (!media || err2) goto Failure;
 
-    Partitionlist *	pmlist;
-    PartitionRecord *	pmp;
-    SInt16		pmindex;
+    // find and extract the 'Schemes' array 
+    CFMutableArrayRef Schemes = (CFMutableArrayRef) CFDictionaryGetValue(media, CFSTR("Schemes"));
+    if (!Schemes) goto Failure;
 
-    pmlist = *partitions;
-    for (pmindex = 0; pmindex < pmlist->count; pmindex++)
-    {
-	pmp = &pmlist->partitions[pmindex];
-	// Need to make the partitions 0 based instead of 1 based
-	if (PMIndex2Slice(pmlist, pmindex) == partitionNumber) {
+    // DMTool just grabs the first "default" scheme, so do the same
+    CFMutableDictionaryRef Scheme = (CFMutableDictionaryRef) CFArrayGetValueAtIndex(Schemes, 0);
+    if (!Scheme) goto Failure;
 
-	    // set partition type (ident)
-	    strcpy(((*partitions)->partitions[pmindex]).PMMain.pmPartType, partitionType);
+    // Then find and extract the 'Sections' array of that scheme:
+    CFMutableArrayRef Sections = (CFMutableArrayRef) CFDictionaryGetValue(Scheme, CFSTR("Sections"));
+    if (!Sections) goto Failure;
 
-	    break;
-	}
-    }
+    // Every scheme can have multiple sections to it, we need to find the 'MAP' section:
+    CFMutableDictionaryRef Section = (CFMutableDictionaryRef) CFArrayDictionarySearch(Sections, CFSTR("ID"), CFSTR("MAP"));
+    if (!Section) goto Failure;
 
-    err = VWritePartitions(partitions, PMEXISTTYPE, PMFIXFINAL | PMFREEGENERATE | PMIGNORESHIMS, mediaDescriptor, MKMediaDeviceIO);
-    if (err) return false;
+    // Then find and extract the 'Partitions' array of that section:
+    CFMutableArrayRef Partitions = (CFMutableArrayRef) CFDictionaryGetValue(Section, CFSTR("Partitions"));
+    if (!Partitions) goto Failure;
 
-    // close device node
-    MKMediaDeviceClose(mediaDescriptor);
-    
-    return true;
+    CFNumberRef partitionIndex = CFNumberCreate(nil, kCFNumberSInt32Type, &partitionNumber);
+    if (!partitionIndex) goto Failure;
+    CFMutableDictionaryRef Partition = (CFMutableDictionaryRef) CFArrayDictionarySearch(Partitions, CFSTR("Partition ID"), partitionIndex);
+    if (!Partition) goto Failure;
+
+    // change the partition type (finally!)
+    CFStringRef Type = CFStringCreateWithCString(nil, partitionType, kCFStringEncodingUTF8);
+    if (!Type) goto Failure;
+    CFDictionarySetValue(Partition, CFSTR("Type"), Type);
+
+    CFMutableDictionaryRef woptions = CFDictionaryCreateMutable(kCFAllocatorDefault,
+								2,
+								&kCFTypeDictionaryKeyCallBacks,
+								&kCFTypeDictionaryValueCallBacks);
+    if (!woptions) goto Failure;
+    CFDictionarySetValue(woptions, CFSTR("Retain existing content"), kCFBooleanTrue);
+    CFDictionarySetValue(woptions, CFSTR("Direct Mode"), kCFBooleanTrue);
+
+    err2 = MKCFWriteMedia(media, nil, nil, woptions, device);
+
+    MKCFDisposeMedia(media);
+    CFRelease(woptions);
+    CFRelease(device);
+    return !err2;
+
+Failure:
+    if (media) MKCFDisposeMedia(media);
+    if (device) CFRelease(device);
+
+    return false;
 }
 
 static void
@@ -180,9 +227,18 @@ addMember(char * uuid, CFStringRef type, int argc, char* argv[])
 	exit(1);
     }
 
+    int partitionCount = argc;
+    char **firstPartition = argv;
+
     while (argc--) {
 	printf("adding partition \"%s\"\n", *argv);
 	CFStringRef partitionName = CFStringCreateWithCString(kCFAllocatorDefault, *argv, kCFStringEncodingUTF8);
+
+	bool success = switchPartition(*argv, kRAID_OFFLINE);
+	if (!success) {
+	    printf("switching the partition on \"%s\" to %s FAILED.\n", *argv, kRAID_OFFLINE);
+	    exit(1);
+	}
 
 	AppleRAIDMemberRef member = AppleRAIDAddMember(setInfo, partitionName, type);
 	if (!member) {
@@ -197,7 +253,21 @@ addMember(char * uuid, CFStringRef type, int argc, char* argv[])
     AppleRAIDSetRef set = AppleRAIDUpdateSet(setInfo);
     CFRelease(setInfo);
 
-    if (!set) printf("something went wrong adding members to the set\n");
+    if (!set) {
+	printf("something went wrong adding members to the set\n");
+	exit(1);
+    }
+
+    while (partitionCount--) {
+	printf("switching the partition on \"%s\" to %s.\n", *firstPartition, kRAID_ONLINE);
+	bool success = switchPartition(*firstPartition, kRAID_ONLINE);
+	if (!success) {
+	    printf("switching the partition on \"%s\" to %s FAILED.\n", *firstPartition, kRAID_ONLINE);
+	    exit(1);
+	}
+
+	firstPartition++;
+    }
 
     // at this point the code should wait for notifications that members and the set are available
 }
@@ -260,6 +330,7 @@ createSet(char * levelCString, char * nameCString, int argc, char* argv[])
     }
 
     if (autoRebuild == AUTO_YES) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetAutoRebuildKey), (void *)kCFBooleanTrue);
+    if (quickRebuild == AUTO_YES) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetQuickRebuildKey), (void *)kCFBooleanTrue);
     if (blockSize) {
 	CFNumberRef blockSizeCF = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &blockSize);
 	if (blockSizeCF) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDChunkSizeKey), (void *)blockSizeCF);
@@ -306,10 +377,10 @@ destroySet(char * nameCString, int argc, char* argv[])
 	exit(1);
     }
 
-    CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
-    if (!name) exit(1);
+    CFStringRef setUUID = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
+    if (!setUUID) exit(1);
 
-    bool success = AppleRAIDDestroySet(name);
+    bool success = AppleRAIDDestroySet(setUUID);
     if (!success) {
 	printf("there was a problem destroying the set %s.\n", nameCString);
     }
@@ -344,6 +415,30 @@ erasePartition(int argc, char* argv[])
 }
 
 static void
+dumpHeader(int argc, char* argv[])
+{
+    if (argc < 1) {
+	usage();
+	exit(1);
+    }
+
+    while (argc--) {
+
+//	printf("dumping the raid header on \"%s\".\n", *argv);
+
+	CFStringRef partitionName = CFStringCreateWithCString(kCFAllocatorDefault, *argv, kCFStringEncodingUTF8);
+	CFDataRef data = AppleRAIDDumpHeader(partitionName);
+
+	if (data) {
+	    AppleRAIDHeaderV2 * header = (AppleRAIDHeaderV2 *)CFDataGetBytePtr(data);
+	    if (header) printf("%s\n", header->plist);
+	}
+
+	argv++;
+    }
+}
+
+static void
 dumpSetProperties(CFMutableDictionaryRef set)
 {
     CFPrintf(CFSTR("\n%@\n"), CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetUUIDKey)));
@@ -357,10 +452,22 @@ dumpSetProperties(CFMutableDictionaryRef set)
     CFPrintf(CFSTR("\tchunk count = %@, chunk size = %@\n"),
 	     CFDictionaryGetValue(set, CFSTR(kAppleRAIDChunkCountKey)),
 	     CFDictionaryGetValue(set, CFSTR(kAppleRAIDChunkSizeKey)));
-    CFPrintf(CFSTR("\tcontent hint = %@, auto rebuild = %@, timeout = %@\n"),
-	     CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetContentHintKey)),
-	     CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetAutoRebuildKey)),
-	     CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetTimeoutKey)));
+
+    CFStringRef level = CFDictionaryGetValue(set, CFSTR(kAppleRAIDLevelNameKey));
+    if (CFStringCompare(level, CFSTR("mirror"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
+	CFPrintf(CFSTR("\tcontent hint = %@, auto = %@, quick = %@, timeout = %@\n"),
+		 CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetContentHintKey)),
+		 CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetAutoRebuildKey)),
+		 CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetQuickRebuildKey)),
+		 CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetTimeoutKey)));
+    } else if (CFStringCompare(level, CFSTR("LVG"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
+	CFPrintf(CFSTR("\tcontent hint = %@, lv count = %@, free space %@\n"),
+		 CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetContentHintKey)),
+		 CFDictionaryGetValue(set, CFSTR(kAppleRAIDLVGVolumeCountKey)),
+		 CFDictionaryGetValue(set, CFSTR(kAppleRAIDLVGFreeSpaceKey)));
+    } else {
+	CFPrintf(CFSTR("\tcontent hint = %@\n"), CFDictionaryGetValue(set, CFSTR(kAppleRAIDSetContentHintKey)));
+    }
 
     if (verbose) CFShow(set);
 }
@@ -373,7 +480,7 @@ dumpMemberProperties(CFMutableDictionaryRef member)
 	     CFDictionaryGetValue(member, CFSTR(kAppleRAIDMemberIndexKey)),
 	     CFDictionaryGetValue(member, CFSTR(kAppleRAIDSequenceNumberKey)),
 	     CFDictionaryGetValue(member, CFSTR("BSD Name")));
-    CFPrintf(CFSTR("\t\tstatus = %@, chunk count = %@, rebuild = %@%%\n"),
+    CFPrintf(CFSTR("\t\tstatus = %@, chunk count = %@, rebuild = %@\n"),
 	     CFDictionaryGetValue(member, CFSTR(kAppleRAIDMemberStatusKey)),
 	     CFDictionaryGetValue(member, CFSTR(kAppleRAIDChunkCountKey)),
 	     CFDictionaryGetValue(member, CFSTR(kAppleRAIDRebuildStatus)));
@@ -382,7 +489,7 @@ dumpMemberProperties(CFMutableDictionaryRef member)
 }
 
 static void
-listSets()
+listRAIDSets()
 {
     UInt32 filter = kAppleRAIDAllSets;
     CFMutableArrayRef theList = AppleRAIDGetListOfSets(filter);
@@ -458,6 +565,8 @@ modifySet(char * setUUIDCString, int argc, char* argv[])
 
     if (autoRebuild == AUTO_YES) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetAutoRebuildKey), (void *)kCFBooleanTrue);
     if (autoRebuild == AUTO_NO) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetAutoRebuildKey), (void *)kCFBooleanFalse);
+    if (quickRebuild == AUTO_YES) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetQuickRebuildKey), (void *)kCFBooleanTrue);
+    if (quickRebuild == AUTO_NO) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetQuickRebuildKey), (void *)kCFBooleanFalse);
     if (blockSize) {
 	CFNumberRef blockSizeCF = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &blockSize);
 	if (blockSizeCF) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDChunkSizeKey), (void *)blockSizeCF);
@@ -470,9 +579,9 @@ modifySet(char * setUUIDCString, int argc, char* argv[])
 	CFNumberRef timeoutCF = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &timeout);
 	if (timeoutCF) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetTimeoutKey), (void *)timeoutCF);
     }
-    if (volName) {
-	CFStringRef volNameCF = CFStringCreateWithCString(kCFAllocatorDefault, volName, kCFStringEncodingUTF8);
-	if (volNameCF) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetNameKey), (void *)volNameCF);
+    if (nickname) {
+	CFStringRef nicknameCF = CFStringCreateWithCString(kCFAllocatorDefault, nickname, kCFStringEncodingUTF8);
+	if (nicknameCF) AppleRAIDModifySet(setInfo, CFSTR(kAppleRAIDSetNameKey), (void *)nicknameCF);
     }
 
     printf("modifying the set \"%s\".\n", setUUIDCString);
@@ -502,6 +611,9 @@ removeMember(char * setUUIDCString, int argc, char* argv[])
 	exit(1);
     }
 
+    int partitionCount = argc;
+    char **firstPartition = argv;
+
     while (argc--) {
 	printf("removing member \"%s\"\n", *argv);
 
@@ -523,6 +635,337 @@ removeMember(char * setUUIDCString, int argc, char* argv[])
     if (set) CFRelease(set);
     CFRelease(setInfo);
     CFRelease(setUUID);
+
+    while (partitionCount--) {
+	printf("switching the partition on \"%s\" to %s.\n", *firstPartition, kRAID_OFFLINE);
+	bool success = switchPartition(*firstPartition, kRAID_OFFLINE);
+	if (!success) {
+	    printf("switching the partition on \"%s\" to %s FAILED.\n", *firstPartition, kRAID_OFFLINE);
+	}
+
+	firstPartition++;
+    }
+}
+
+static void
+createLogicalVolume(char * nameCString, char * volTypeCString, int argc, char* argv[])
+{
+    if (!nameCString || argc) {
+	usage();
+	exit(1);
+    }
+
+    CFStringRef lvgUUID = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
+    if (!lvgUUID) exit(1);
+
+    if (!volSize) volSize = 0x40000000;
+
+    CFStringRef volType = 0;
+    if (volTypeCString) {
+	volType = CFStringCreateWithCString(kCFAllocatorDefault, volTypeCString, kCFStringEncodingUTF8);
+    } else {
+	volType = CFSTR(kAppleLVMVolumeTypeConcat);
+    }
+    if (!volType) exit(1);
+
+    CFMutableDictionaryRef lvDict = AppleLVMCreateVolume(lvgUUID, volType, volSize, CFSTR(kAppleLVMVolumeLocationFast));
+    if (!lvDict) {
+	printf("there was a problem allocating/setting up the logical volume\n");
+	exit(1);
+    }
+
+    if (nickname) {
+	CFStringRef nameCF = CFStringCreateWithCString(kCFAllocatorDefault, nickname, kCFStringEncodingUTF8);
+	if (nameCF) AppleLVMModifyVolume(lvDict, CFSTR(kAppleLVMVolumeNameKey), (void *)nameCF);
+    }
+
+    if (hint) {
+	CFStringRef hintCF = CFStringCreateWithCString(kCFAllocatorDefault, hint, kCFStringEncodingUTF8);
+	if (hintCF) AppleLVMModifyVolume(lvDict, CFSTR(kAppleLVMVolumeContentHintKey), (void *)hintCF);
+    }
+
+    AppleLVMVolumeRef volRef = AppleLVMUpdateVolume(lvDict);
+    if (!volRef) {
+	printf("there was a problem writing out the logical volume onto the group %s.\n", nameCString);
+	exit(2);
+    }
+}
+
+static void
+destroyLogicalVolume(char * nameCString, int argc, char* argv[])
+{
+    if (!nameCString || argc) {
+	usage();
+	exit(1);
+    }
+
+    CFStringRef lvUUID = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
+    if (!lvUUID) exit(1);
+
+    bool success = AppleLVMDestroyVolume(lvUUID);
+    if (!success) {
+	printf("there was a problem destroying the logical volume %s.\n", nameCString);
+    }
+}
+
+static void
+dumpLogicalVolumeExtents(CFMutableDictionaryRef lv)
+{
+    CFStringRef lvUUID = CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeUUIDKey));
+    if (!lvUUID) { printf("\ninternal error, no uuid in lv dict\n"); return; };
+    
+    CFDataRef extentData = (CFDataRef)AppleLVMGetVolumeExtents(lvUUID);
+    if (!extentData) { printf("\nno extent data found?\n"); return; };
+
+    AppleRAIDExtentOnDisk * extentList = (AppleRAIDExtentOnDisk *)CFDataGetBytePtr(extentData);
+    UInt64 extentCount = CFDataGetLength(extentData) / sizeof(AppleRAIDExtentOnDisk);
+    if (!extentCount || !extentList) { printf("\nextent data empty?\n"); return; };
+
+    printf("\textent list:\n");
+	       
+    UInt32 i;
+    for (i = 0; i < extentCount; i++) {
+	printf("  %20llu - %12llu (%llu)\n",
+	       extentList[i].extentByteOffset,
+	       extentList[i].extentByteOffset + extentList[i].extentByteCount - 1,
+	       extentList[i].extentByteCount);
+    }
+}
+
+static void
+dumpLogicalVolumeProperties(CFMutableDictionaryRef lv)
+{
+    CFPrintf(CFSTR("\n%@\n"), CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeUUIDKey)));
+    CFPrintf(CFSTR("\t\"%@\" type = %@ /dev/%@\n"),
+	     CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeNameKey)),
+	     CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeTypeKey)),
+	     CFDictionaryGetValue(lv, CFSTR("BSD Name")));
+    CFPrintf(CFSTR("\tbyte size = %@, content hint = %@\n"),
+	     CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeSizeKey)),
+	     CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeContentHintKey)));
+    CFPrintf(CFSTR("\tstatus = %@, sequence = %@ extent count = %@\n"),
+	     CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeStatusKey)),
+	     CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeSequenceKey)),
+	     CFDictionaryGetValue(lv, CFSTR(kAppleLVMVolumeExtentCountKey)));
+    CFStringRef parent = CFDictionaryGetValue(lv, CFSTR(kAppleLVMParentUUIDKey));
+    if (parent) CFPrintf(CFSTR("\tparent = %@\n"), parent);
+
+    if (extents) dumpLogicalVolumeExtents(lv);
+
+    if (verbose) CFShow(lv);
+}
+
+static void listLogicalVolumes(char * nameCString, int argc, char* argv[]);
+
+static void
+listAllLogicalVolumes()
+{
+    UInt32 filter = kAppleRAIDAllSets;
+    CFMutableArrayRef theList = AppleRAIDGetListOfSets(filter);
+    CFIndex setCount = theList ? CFArrayGetCount(theList) : 0;
+
+    CFIndex i;
+    for (i=0; i < setCount; i++) {
+
+	CFStringRef setName = (CFStringRef)CFArrayGetValueAtIndex(theList, i);
+	if (setName) {
+	    CFMutableDictionaryRef setProp = AppleRAIDGetSetProperties(setName);
+	    if (!setProp) continue;
+	    
+	    CFStringRef level = CFDictionaryGetValue(setProp, CFSTR(kAppleRAIDLevelNameKey));
+	    if (!level) continue;
+	    
+	    if (CFStringCompare(level, CFSTR("LVG"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
+
+		dumpSetProperties(setProp);
+
+		char uuid[256];
+		if (CFStringGetCString(setName, uuid, 256, kCFStringEncodingUTF8)) {
+		    listLogicalVolumes(uuid, 0, NULL);
+		}
+	    }
+
+	    CFRelease(setProp);
+	}
+    }
+    if (theList) CFRelease(theList);
+}
+
+
+static void
+listLogicalVolumes(char * nameCString, int argc, char* argv[])
+{
+    if (!nameCString && !argc) {
+	listAllLogicalVolumes();
+	exit(0);
+    }
+
+    if (!nameCString && argc == 1) nameCString = argv[0];  // hack
+    if (!nameCString) { 
+	usage();
+	exit(1);
+    }
+
+    CFStringRef lvUUID = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
+    if (!lvUUID) exit(1);
+
+    // try for one logical volume
+    CFMutableDictionaryRef props = AppleLVMGetVolumeProperties(lvUUID);
+    if (props) {
+	dumpLogicalVolumeProperties(props);
+	CFRelease(props);
+	return;
+    }
+
+    // go for all volumes in the group
+    CFMutableArrayRef volumes = AppleLVMGetVolumesForGroup(lvUUID, NULL);
+    if (!volumes) {
+	printf("there was a problem finding the logical volume/group %s.\n", nameCString);
+	exit(1);
+    }
+
+    int count = CFArrayGetCount(volumes);
+    if (count == 0) {
+	printf("\n%s contains no logical volumes.\n", nameCString);
+	return;
+    }
+    
+    int i;
+    for (i = 0; i < count; i++) {
+	
+	CFStringRef UUID = (CFStringRef)CFArrayGetValueAtIndex(volumes, i);
+
+	CFMutableDictionaryRef props = AppleLVMGetVolumeProperties(UUID);
+	if (props) {
+	    dumpLogicalVolumeProperties(props);
+	    CFRelease(props);
+	}
+    }
+    printf("\n");
+}
+
+static void
+modifyLogicalVolume(char * nameCString, int argc, char* argv[])
+{
+    if (!nameCString || argc) {
+	usage();
+	exit(1);
+    }
+
+    CFStringRef lvUUID = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
+    if (!lvUUID) exit(1);
+
+    CFMutableDictionaryRef lvDict = AppleLVMGetVolumeProperties(lvUUID);
+    if (!lvDict) {
+	printf("there was a problem finding the logical volume %s.\n", nameCString);
+	exit(1);
+    }
+
+    if (nickname) {
+	CFStringRef nameCF = CFStringCreateWithCString(kCFAllocatorDefault, nickname, kCFStringEncodingUTF8);
+	if (nameCF) AppleLVMModifyVolume(lvDict, CFSTR(kAppleLVMVolumeNameKey), (void *)nameCF);
+    }
+
+    if (hint) {
+	CFStringRef hintCF = CFStringCreateWithCString(kCFAllocatorDefault, hint, kCFStringEncodingUTF8);
+	if (hintCF) AppleLVMModifyVolume(lvDict, CFSTR(kAppleLVMVolumeContentHintKey), (void *)hintCF);
+    }
+
+    AppleLVMVolumeRef volRef = AppleLVMUpdateVolume(lvDict);
+    if (!volRef) {
+	printf("there was a problem updating the logical volume %s.\n", nameCString);
+	exit(2);
+    }
+}
+
+static void
+resizeLogicalVolume(char * nameCString, int argc, char* argv[])
+{
+    if (!nameCString || argc) {
+	usage();
+	exit(1);
+    }
+
+    CFStringRef lvUUID = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
+    if (!lvUUID) exit(1);
+
+    CFMutableDictionaryRef lvProps = AppleLVMGetVolumeProperties(lvUUID);
+    if (!lvProps) {
+	printf("there was a problem finding the logical volume %s.\n", nameCString);
+	exit(1);
+    }
+
+    if (!volSize) {
+	CFNumberRef number = (CFNumberRef)CFDictionaryGetValue(lvProps, CFSTR(kAppleLVMVolumeSizeKey));
+	if (number) CFNumberGetValue(number, kCFNumberSInt64Type, &volSize);
+	volSize += 0x40000000;
+    }
+
+    UInt64 newSize = AppleLVMResizeVolume(lvProps, volSize);
+    if (!newSize) {
+	printf("there was a problem resizing the logical volume %s.\n", nameCString);
+	exit(1);
+    }
+    
+    AppleLVMVolumeRef volRef = AppleLVMUpdateVolume(lvProps);
+    if (!volRef) {
+	printf("there was a problem updating the logical volume %s.\n", nameCString);
+	exit(2);
+    }
+
+    printf("the logical volume %s has been resized to 0x%lld.\n", nameCString, newSize);
+}
+
+static void
+snapshotLogicalVolume(char * nameCString, char * snapType, int argc, char* argv[])
+{
+    if (!nameCString || argc) {
+	usage();
+	exit(1);
+    }
+
+    CFStringRef lvUUID = CFStringCreateWithCString(kCFAllocatorDefault, nameCString, kCFStringEncodingUTF8);
+    if (!lvUUID) exit(1);
+
+    CFMutableDictionaryRef lvProps = AppleLVMGetVolumeProperties(lvUUID);
+    if (!lvProps) {
+	printf("there was a problem finding the logical volume %s.\n", nameCString);
+	exit(1);
+    }
+
+    CFStringRef lvType = 0;
+    if (snapType) {
+	lvType = CFStringCreateWithCString(kCFAllocatorDefault, snapType, kCFStringEncodingUTF8);
+    } else {
+	lvType = CFSTR(kAppleLVMVolumeTypeSnapRO);
+    }
+    if (!lvType) exit(1);
+
+    UInt64 percent = 0;
+    if (volSize < 100) percent = volSize;
+    if (volSize <= 100) volSize = 0;
+
+    if (!volSize) {
+	CFNumberRef number = (CFNumberRef)CFDictionaryGetValue(lvProps, CFSTR(kAppleLVMVolumeSizeKey));
+	if (number) CFNumberGetValue(number, kCFNumberSInt64Type, &volSize);
+    }
+    if (percent) volSize = volSize * percent / (UInt64)100;
+
+    // create the snap
+    CFMutableDictionaryRef snapProps = AppleLVMSnapShotVolume(lvProps, lvType, volSize);
+    if (!snapProps) {
+	printf("there was a problem initializing the snapshot for %s.\n", nameCString);
+	exit(1);
+    }
+
+    // write to disk
+    AppleLVMVolumeRef snapRef = AppleLVMUpdateVolume(snapProps);
+    if (!snapRef) {
+	printf("there was a problem updating the snapshot volume.\n");
+	exit(2);
+    }
+
+    printf("the logical volume %s now has a snapshot.\n", nameCString);
 }
 
 static void
@@ -537,93 +980,149 @@ callBack(CFNotificationCenterRef center, void *observer, CFStringRef name, const
     printf("Notification for %s, event = %s.\n", setName, event); fflush(stdout);
 }
 
+static void signalHandler(int sigraised);
+
 int
 main(int argc, char* argv[])
 {
-    bool add = false, create = false, destroy = false, erase = false, list = false;
+    bool add = false, create = false, destroy = false, erase = false, header = false;
+    bool list = false, lvcreate = false, lvdestroy = false, lvlist = false, lvmodify = false, lvresize = false, lvsnap = false;
     bool modify = false, remove = false, spare = false, watch = false;
-    char * setLevel = 0, * setName = 0;
+    char * setLevel = 0, * setName = 0; 
 
     /* options descriptor */
     static struct option longopts[] = {
-	{ "auto-rebuild",required_argument,	0,		'A' },
-	{ "block-size",	required_argument,	0,		'B' },
-	{ "hint",	required_argument,	0,		'H' },
-	{ "level",	required_argument,	0,		'L' },
-	{ "name",	required_argument,	0,		'N' },
-	{ "timeout",	required_argument,	0,		'T' },
+	{ "add",	required_argument,	0,	'a' },
+	{ "create",	no_argument,		0,	'c' },
+	{ "destroy",	required_argument,	0,	'd' },
+	{ "erase",	no_argument,		0,	'e' },
+	{ "header",	no_argument,		0,	'h' },
+	{ "list",	no_argument,		0,	'l' },
+	{ "modify",	required_argument,	0,	'm' },
+	{ "remove",	required_argument,	0,	'r' },
+	{ "spare",	required_argument,	0,	's' },
+	{ "watch",	no_argument,		0,	'w' },
+	
+	{ "lvcreate",	required_argument,	0,	'C' },
+	{ "lvdestroy",	required_argument,	0,	'D' },
+	{ "lvlist",	no_argument,		0,	'L' },
+	{ "lvmodify",	required_argument,	0,	'M' },
+	{ "lvresize",	required_argument,	0,	'R' },
+	{ "lvsnap",	required_argument,	0,	'S' },
+	
+	{ "auto-rebuild",required_argument,	0,	'A' },
+	{ "block-size", required_argument,	0,	'B' },
+	{ "extents",	no_argument,		0,	'E' },
+	{ "hint",	required_argument,	0,	'H' },
+	{ "level",	required_argument,	0,	'V' },
+	{ "name",	required_argument,	0,	'N' },
+	{ "quick-rebuild",required_argument,	0,	'Q' },
+	{ "size",	required_argument,	0,	'Z' },
+	{ "timeout",	required_argument,	0,	'T' },
 
-	{ "add",	required_argument,	0,		'a' },
-	{ "create",	no_argument,		0,		'c' },
-	{ "destroy",	required_argument,	0,		'd' },
-	{ "erase",	optional_argument,	0,		'e' },
-	{ "help",	no_argument,		0,		'?' },
-	{ "list",	no_argument,		0,		'l' },
-	{ "modify",	required_argument,	0,		'm' },
-	{ "remove",	required_argument,	0,		'r' },
-	{ "spare",	required_argument,	0,		's' },
-	{ "verbose",	no_argument,		0,		'v' },
-	{ "watch",	no_argument,		0,		'w' },
-	{ 0,		0,			0,		0 }
+	{ "verbose",	no_argument,		0,	'v' },
+	{ "help",	no_argument,		0,	'?' },
+	{ 0,		0,			0,	0   }
     };
 
     int ch;
-    while ((ch = getopt_long(argc, argv, "A:B:H:L:N:T:a:cd:elm:r:s:vw?", longopts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "a:cd:ehlm:r:s:wC:D:LM:R:S:A:B:EH:V:N:Q:Z:T:v?", longopts, NULL)) != -1) {
 	
 	switch(ch) {
-	case 'A':
-	    autoRebuild = ((optarg[0] == 'Y') || (optarg[0] == 'y')) ? AUTO_YES : AUTO_NO;
-	    break;
-	case 'B':
-	    sscanf(optarg, "%llx", &blockSize);
-	    break;
-	case 'H':
-	    hint = strdup(optarg);
-	    break;
-	case 'L':
-	    setLevel = optarg;
-	    break;
-	case 'N':
-	    volName = optarg;
-	    break;
-	case 'T':
-	    sscanf(optarg, "%llx", &timeout);
-	    break;
 
 	case 'a':
 	    add = true;
-	    setName = optarg;
+	    setName = strdup(optarg);
 	    break;
 	case 'c':
 	    create = true;
 	    break;
 	case 'd':
 	    destroy = true;
-	    setName = optarg;
+	    setName = strdup(optarg);
 	    break;
 	case 'e':
 	    erase = true;
+	    break;
+	case 'h':
+	    header = true;
 	    break;
 	case 'l':
 	    list = true;
 	    break;
 	case 'm':
 	    modify = true;
-	    setName = optarg;
+	    setName = strdup(optarg);
 	    break;
 	case 'r':
 	    remove = true;
-	    setName = optarg;
+	    setName = strdup(optarg);
 	    break;
 	case 's':
 	    spare = true;
-	    setName = optarg;
-	    break;
-	case 'v':
-	    verbose = true;
+	    setName = strdup(optarg);
 	    break;
 	case 'w':
 	    watch = true;
+	    break;
+
+	    
+	case 'C':
+	    lvcreate = true;
+	    setName = strdup(optarg);
+	    break;
+	case 'D':
+	    lvdestroy = true;
+	    setName = strdup(optarg);
+	    break;
+	case 'L':
+	    lvlist = true;
+	    break;
+	case 'M':
+	    lvmodify = true;
+	    setName = strdup(optarg);
+	    break;
+	case 'R':
+	    lvresize = true;
+	    setName = strdup(optarg);
+	    break;
+	case 'S':
+	    lvsnap = true;
+	    setName = strdup(optarg);
+	    break;
+
+
+	case 'A':
+	    autoRebuild = ((optarg[0] == 'Y') || (optarg[0] == 'y')) ? AUTO_YES : AUTO_NO;
+	    break;
+	case 'B':
+	    sscanf(optarg, "%lli", &blockSize);
+	    break;
+	case 'E':
+	    extents = true;
+	    break;
+	case 'H':
+	    hint = strdup(optarg);
+	    break;
+	case 'V':
+	    setLevel = strdup(optarg);
+	    break;
+	case 'N':
+	    nickname = strdup(optarg);
+	    break;
+	case 'Q':
+	    quickRebuild = ((optarg[0] == 'Y') || (optarg[0] == 'y')) ? AUTO_YES : AUTO_NO;
+	    break;
+	case 'Z':
+	    sscanf(optarg, "%lli", &volSize);
+	    break;
+	case 'T':
+	    sscanf(optarg, "%lli", &timeout);
+	    break;
+
+
+	case 'v':
+	    verbose = true;
 	    break;
 	case 0:
 	case '?':
@@ -635,13 +1134,19 @@ main(int argc, char* argv[])
     argc -= optind;
     argv += optind;
 
-    if (!add && !create && !destroy && !erase && !list && !modify && !remove && !spare && !watch) {
+    if (!add && !create && !destroy && !erase && !header && !list && !modify && !remove && !spare && !watch &&
+	!lvcreate && !lvdestroy && !lvlist && !lvmodify && !lvresize && !lvsnap) {
 	usage();
 	exit(0);
     }
 
     if (list) {
-	listSets();
+	listRAIDSets();
+	exit(0);
+    }
+
+    if (lvlist) {
+	listLogicalVolumes(NULL, argc, argv);
 	exit(0);
     }
 
@@ -655,12 +1160,10 @@ main(int argc, char* argv[])
 	exit(0);
     };
 
-//XXX new for tiger - remove this
-//XXX new for tiger - remove this
-CF_EXPORT CFNotificationCenterRef CFNotificationCenterGetLocalCenter(void);
-//XXX new for tiger - remove this
-//XXX new for tiger - remove this
-
+    if (header) {
+	dumpHeader(argc, argv);
+	exit(0);
+    };
 
     if (watch) {
 
@@ -685,22 +1188,46 @@ CF_EXPORT CFNotificationCenterRef CFNotificationCenterGetLocalCenter(void);
 					NULL,					// const void *object
 					CFNotificationSuspensionBehaviorHold);
 
+	CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
+					NULL,					// const void *observer
+					callBack,
+					CFSTR(kAppleLVMNotificationVolumeDiscovered),
+					NULL,					// const void *object
+					CFNotificationSuspensionBehaviorHold);
+
+	CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
+					NULL,					// const void *observer
+					callBack,
+					CFSTR(kAppleLVMNotificationVolumeTerminated),
+					NULL,					// const void *object
+					CFNotificationSuspensionBehaviorHold);
+
+	CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
+					NULL,					// const void *observer
+					callBack,
+					CFSTR(kAppleLVMNotificationVolumeChanged),
+					NULL,					// const void *object
+					CFNotificationSuspensionBehaviorHold);
+
 	// this will not fail if there is no raid controller, ie, if AppleRAID class is not instantiated in the kernel
 
 	AppleRAIDEnableNotifications();
     }
 
 
-
-
     if (add) addMember(setName, CFSTR(kAppleRAIDMembersKey), argc, argv);
-    if (create) createSet(setLevel, volName, argc, argv);
+    if (create) createSet(setLevel, nickname, argc, argv);
     if (destroy) destroySet(setName, argc, argv);
     if (modify) modifySet(setName, argc, argv);
     if (remove) removeMember(setName, argc, argv);
     if (spare) addMember(setName, CFSTR(kAppleRAIDSparesKey), argc, argv);
 
-
+    
+    if (lvcreate) createLogicalVolume(setName, setLevel, argc, argv);
+    if (lvdestroy) destroyLogicalVolume(setName, argc, argv);
+    if (lvmodify) modifyLogicalVolume(setName, argc, argv);
+    if (lvresize) resizeLogicalVolume(setName, argc, argv);
+    if (lvsnap) snapshotLogicalVolume(setName, setLevel, argc, argv);
 
     
     if (watch) {
@@ -709,7 +1236,6 @@ CF_EXPORT CFNotificationCenterRef CFNotificationCenterGetLocalCenter(void);
 
 	// Set up a signal handler so we can clean up when we're interrupted from the command line
 	// Otherwise we stay in our run loop forever.
-	static void signalHandler(int sigraised);
 	sig_t oldHandler = signal(SIGINT, signalHandler);
 	if (oldHandler == SIG_ERR) {
 	    printf("Could not establish new signal handler");

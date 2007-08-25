@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2005 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2001-2007 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -26,8 +26,8 @@
 
 #define kAppleRAIDLevelNameMirror "Mirror"
 
-extern const OSSymbol * gAppleRAIDMirrorName;
-    
+#ifdef KERNEL
+
 class AppleRAIDMirrorSet : public AppleRAIDSet
 {
     OSDeclareDefaultStructors(AppleRAIDMirrorSet);
@@ -35,6 +35,9 @@ class AppleRAIDMirrorSet : public AppleRAIDSet
  private:
     UInt32			arExpectingLiveAdd;
     thread_call_t		arSetCompleteThreadCall;
+
+    UInt64 *			arLastSeek;			
+    UInt64 *			arSkippedIOCount;
     
     AppleRAIDMember *		arRebuildingMember;
     thread_call_t		arRebuildThreadCall;
@@ -47,6 +50,9 @@ class AppleRAIDMirrorSet : public AppleRAIDSet
     virtual bool initWithHeader(OSDictionary * header, bool firstTime);
     virtual void free();
 
+    virtual IOBufferMemoryDescriptor * readPrimaryMetaData(AppleRAIDMember * member);
+    virtual IOReturn writePrimaryMetaData(IOBufferMemoryDescriptor * primaryBuffer);
+
     virtual void rebuildStart(void);
     virtual void rebuild(void);
     virtual void rebuildComplete(bool wasRebuilt);
@@ -54,9 +60,13 @@ class AppleRAIDMirrorSet : public AppleRAIDSet
     virtual void getRecoverQueue(queue_head_t *oldRequestQueue, queue_head_t *newRequestQueue);
     virtual bool recover(void);
 
+    virtual void startSetCompleteTimer();
+    virtual void setCompleteTimeout(void);
+
 public:
     static AppleRAIDSet * createRAIDSet(AppleRAIDMember * firstMember);
     virtual bool addMember(AppleRAIDMember * member);
+    virtual bool removeMember(AppleRAIDMember * member, IOOptionBits options);
 
     virtual bool resizeSet(UInt32 newMemberCount);
     virtual bool startSet(void);
@@ -64,8 +74,10 @@ public:
 
     virtual bool isSetComplete(void);
     virtual bool bumpOnError(void);
+    virtual UInt32 nextSetState(void);
+    virtual OSDictionary * getSetProperties(void);
 
-    virtual void setCompleteTimeout(void);
+    virtual void activeReadMembers(AppleRAIDMember ** activeMembers, UInt64 byteStart, UInt32 byteCount);
 
     virtual void completeRAIDRequest(AppleRAIDStorageRequest *storageRequest);
     
@@ -79,7 +91,6 @@ class AppleRAIDMirrorMemoryDescriptor : public AppleRAIDMemoryDescriptor
     OSDeclareDefaultStructors(AppleRAIDMirrorMemoryDescriptor);
     
 private:
-    UInt32		mdMemberCount;
     UInt32		mdSetBlockSize;
     UInt32		mdSetBlockStart;
     UInt32		mdSetBlockOffset;
@@ -91,6 +102,9 @@ protected:
 public:
     static AppleRAIDMemoryDescriptor *withStorageRequest(AppleRAIDStorageRequest *storageRequest, UInt32 memberIndex);
     virtual IOPhysicalAddress getPhysicalSegment(IOByteCount offset, IOByteCount *length);
+    virtual addr64_t getPhysicalSegment64(IOByteCount offset, IOByteCount *length);
 };
+
+#endif KERNEL
 
 #endif /* ! _APPLERAIDMIRRORSET_H */

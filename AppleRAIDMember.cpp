@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2005 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2001-2007 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -80,6 +80,8 @@ bool AppleRAIDMember::init(OSDictionary * properties)
     arIsEjectable = false;
     arNativeBlockSize = 0;
     arSyncronizeCacheThreadCall = 0;
+
+    arMemberIndex = 0xffffffff;
     
 #ifdef DEBUG
     IOSleep(500);  // let the system log catch up
@@ -128,15 +130,15 @@ bool AppleRAIDMember::start(IOService * provider)
 	arNativeBlockSize = arTarget->getPreferredBlockSize();
 
 	if (!arSyncronizeCacheThreadCall) {
-	    arSyncronizeCacheThreadCall = thread_call_allocate((thread_call_func_t)&AppleRAIDMember::synchronizeCacheCallout,
-							       (thread_call_param_t)this);
+	    thread_call_func_t syncCacheMethod = OSMemberFunctionCast(thread_call_func_t, this, &AppleRAIDMember::synchronizeCacheCallout);
+	    arSyncronizeCacheThreadCall = thread_call_allocate(syncCacheMethod, (thread_call_param_t)this);
 	    if (arSyncronizeCacheThreadCall == 0) return false;
 	}
     }
 
     arIsRAIDMember = false;
     arMemberState = kAppleRAIDMemberStateClosed;
-    setProperty(kAppleRAIDMemberStatusKey, kAppleRAIDStatusOffline);
+    setProperty(kAppleRAIDMemberStatusKey, kAppleRAIDStatusOnline);
 
     //  if no raid header just return
     if (readRAIDHeader()) {
@@ -284,6 +286,7 @@ IOReturn AppleRAIDMember::synchronizeCacheCallout(AppleRAIDSet *masterSet)
 //***************************************************************************************************************
 //***************************************************************************************************************
 
+
 IOReturn AppleRAIDMember::readRAIDHeader(void)
 {
     UInt64 size = getSize();
@@ -317,8 +320,8 @@ readheader:
     if (rc) return rc;
     
     // Make sure the AppleRAID Header contains the correct signature.
-    char * buffer = (char *)arHeaderBuffer->getBytesNoCopy();
-    if (strcmp(buffer, kAppleRAIDSignature)) {
+    AppleRAIDHeaderV2 * header = (AppleRAIDHeaderV2 *)arHeaderBuffer->getBytesNoCopy();
+    if (strncmp(header->raidSignature, kAppleRAIDSignature, sizeof(header->raidSignature))) {
 
 	if (arHeaderOffset) {
 	    arHeaderOffset = 0;	// try for old v1 header at beginning of disk
@@ -346,6 +349,9 @@ readheader:
 
     setProperty(kAppleRAIDMemberUUIDKey, getHeaderProperty(kAppleRAIDMemberUUIDKey));
     setProperty(kAppleRAIDSetUUIDKey, getHeaderProperty(kAppleRAIDSetUUIDKey));
+
+    OSNumber * number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDMemberIndexKey));
+    arMemberIndex= number ? number->unsigned32BitValue() : 0xffffffff;
 
     IOLog1(">>>>> %s %s %s <<<<<\n", getSetNameString(), getSetUUIDString(), getUUIDString());
     IOLog2("AppleRAIDMember::readRAIDHeader(%p): was %ssuccessful\n", this, rc ? "un" : "");
@@ -439,6 +445,7 @@ IOReturn AppleRAIDMember::zeroRAIDHeader(void)
 //***************************************************************************************************************
 //***************************************************************************************************************
 
+
 #define ByteSwapHeaderV1(header) \
 { \
         (header)->raidHeaderSize	= OSSwapBigToHostInt32((header)->raidHeaderSize); \
@@ -511,7 +518,6 @@ IOReturn AppleRAIDMember::parseRAIDHeaderV1()
     setHeaderProperty(kAppleRAIDChunkCountKey, chunkCount, 64);
 
     if (header->raidLevel == kAppleRAIDMirror) {
-
 	setHeaderProperty(kAppleRAIDSetTimeoutKey, 30, 32);
 	setHeaderProperty(kAppleRAIDSetAutoRebuildKey, kOSBooleanFalse);
     }
@@ -552,8 +558,10 @@ IOReturn AppleRAIDMember::parseRAIDHeaderV2()
     OSString * errmsg = 0;
     OSDictionary * props = OSDynamicCast(OSDictionary, OSUnserializeXML(headerBuffer->plist, &errmsg));
     if (!props) {
-	if (errmsg) IOLog("AppleRAIDMember::parseRAIDHeaderV2 - RAID header parsing failed with %s\n", errmsg->getCStringNoCopy());
-	errmsg->release();
+	if (errmsg) {
+	    IOLog("AppleRAIDMember::parseRAIDHeaderV2 - RAID header parsing failed with %s\n", errmsg->getCStringNoCopy());
+	    errmsg->release();
+	}
 	return kIOReturnBadArgument;
     }
 
@@ -581,41 +589,149 @@ IOReturn AppleRAIDMember::buildOnDiskHeaderV2(void)
 {
     IOLog2("AppleRAIDMember::buildOnDiskHeaderV2(%p) entered\n", this);
 
+    // make a copy of incore header and filter out the internal stuff
+    OSDictionary * copy = OSDictionary::withCapacity(arHeader->getCount());
+    if (!copy) return kIOReturnNoMemory;
+    OSCollectionIterator * iter = OSCollectionIterator::withCollection(arHeader);
+    if (!iter) return kIOReturnNoMemory;
+
+    while (const OSString * key = OSDynamicCast(OSString, iter->getNextObject())) {
+
+	// if the key starts with "AppleRAID-" copy it
+	char * match = "AppleRAID-";
+	int matchSize = sizeof(match) - 1;
+    
+	if (!strncmp(match, key->getCStringNoCopy(), matchSize)) {
+	    copy->setObject(key, arHeader->getObject(key));
+	}
+    }
+    iter->release();
+
     // serialize header to on-disk format
     OSSerialize * s = OSSerialize::withCapacity(kAppleRAIDHeaderSize);
     if (!s) return kIOReturnNoMemory;
 
     s->clearText();
-    if (!arHeader->serialize(s)) return kIOReturnInternalError;
+    if (!copy->serialize(s)) return kIOReturnInternalError;
+    copy->release();
 
     if (s->getLength() >= (kAppleRAIDHeaderSize - sizeof(AppleRAIDHeaderV2))) return kIOReturnNoResources;
 
     AppleRAIDHeaderV2 * headerBuffer = (AppleRAIDHeaderV2 *)arHeaderBuffer->getBytesNoCopy();
 
     // set up header header
-    strncpy(headerBuffer->raidSignature, kAppleRAIDSignature, 16);
-    strncpy(headerBuffer->raidUUID, getSetUUIDString(), 64);
-    strncpy(headerBuffer->memberUUID, getUUIDString(), 64);
+    strlcpy(headerBuffer->raidSignature, kAppleRAIDSignature, sizeof(headerBuffer->raidSignature));
+    strlcpy(headerBuffer->raidUUID, getSetUUIDString(), sizeof(headerBuffer->raidUUID));
+    strlcpy(headerBuffer->memberUUID, getUUIDString(), sizeof(headerBuffer->memberUUID));
 
     // calculate the byte size for the raid data
-    OSNumber * number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDChunkCountKey));
-    if (!number) return kIOReturnInternalError;
-    headerBuffer->size = number->unsigned64BitValue();
-
-    number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDChunkSizeKey));
-    if (!number) return kIOReturnInternalError;
-    headerBuffer->size *= number->unsigned64BitValue();
+    headerBuffer->size = getUsableSize();
     if (headerBuffer->size == 0) return kIOReturnInternalError;
-        
+
     bcopy(s->text(), headerBuffer->plist, s->getLength());
+    UInt32 bzSize = kAppleRAIDHeaderSize - (UInt32)((char *)headerBuffer->plist - (char *)headerBuffer) - s->getLength();
+    bzero(headerBuffer->plist + s->getLength(), bzSize);
 
-    // XXX bzero the rest
+    s->release();
 
-    if (s) s->release();
+    ByteSwapHeaderV2(headerBuffer);
 
     IOLog2("AppleRAIDMember::buildOnDiskHeaderV2(%p) successful.\n", this);
     return kIOReturnSuccess;
 }    
+
+
+//***************************************************************************************************************
+//***************************************************************************************************************
+//***************************************************************************************************************
+
+IOBufferMemoryDescriptor *
+AppleRAIDMember::readPrimaryMetaData()
+{
+    IOLog1("AppleRAIDMember::readPrimaryMetaData(%p) entered.\n", this);
+    
+    // get the reserved size of primary data area
+    OSNumber * number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDPrimaryMetaDataUsedKey));
+    if (!number) return NULL;
+    UInt64 primarySize = number->unsigned64BitValue();
+    if (primarySize == 0) return NULL;
+
+    primarySize = (((primarySize - 1) / 4096) + 1) * 4096;   // round up for i/o
+
+    // calculate the start of primary data
+    UInt64 primaryOffset = getUsableSize();
+    if (primaryOffset == 0) return NULL;
+
+    IOBufferMemoryDescriptor * primaryBuffer = 0;
+
+    // Allocate a buffer to read into
+    if (primaryBuffer == 0) {
+	primaryBuffer = IOBufferMemoryDescriptor::withCapacity(primarySize, kIODirectionNone);
+	if (primaryBuffer == 0) return NULL;
+    }
+
+    IOLog1("AppleRAIDMember::readPrimaryMetaData(%p) size %llu  primary off %llu\n", this, primarySize, primaryOffset);
+    
+    // Open the member
+    if (!getTarget()->open(this, 0, kIOStorageAccessReader)) return NULL;
+
+    // Read in the primary data from member
+    primaryBuffer->setDirection(kIODirectionIn);
+    IOReturn rc = getTarget()->read(this, primaryOffset, primaryBuffer);
+        
+    // Close the member.
+    getTarget()->close(this, 0);
+
+    if (rc) {
+	primaryBuffer->release();
+	return NULL;
+    }
+    
+    // Make sure the AppleRAID Header contains the correct signature.
+    AppleRAIDPrimaryOnDisk * primary = (AppleRAIDPrimaryOnDisk *)primaryBuffer->getBytesNoCopy();
+    if (strncmp(primary->priMagic, kAppleRAIDPrimaryMagic, sizeof(primary->priMagic))) {
+	primaryBuffer->release();
+	return NULL;
+    }
+
+    IOLog1("AppleRAIDMember::readPrimaryMetaData(%p): was %ssuccessful\n", this, rc ? "un" : "");
+    return primaryBuffer;
+}
+
+
+IOReturn AppleRAIDMember::writePrimaryMetaData(IOBufferMemoryDescriptor * primaryBuffer)
+{
+    IOLog1("AppleRAIDMember::writePrimaryMetaData(%p) entered.\n", this);
+
+    // this code assumes that members are already opened for write
+    if ((primaryBuffer == 0) || (!handleIsOpen(0))) {
+	IOLog1("AppleRAIDMember::writePrimaryMetaData(%p): aborting, rc = %x.\n", this, kIOReturnInternalError);
+	return kIOReturnInternalError;
+    }
+
+    // get the reserved size of primary data area
+    OSNumber * number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDPrimaryMetaDataUsedKey));
+    if (!number) return kIOReturnUnformattedMedia;
+    UInt64 primarySize = number->unsigned64BitValue();
+    if (primarySize == 0) return kIOReturnUnformattedMedia;
+
+    primarySize = (((primarySize - 1) / 4096) + 1) * 4096;   // round up for i/o
+
+    if (primaryBuffer->getLength() > primarySize) return kIOReturnInternalError;
+
+    // calculate the start of primary data
+    UInt64 primaryOffset = getUsableSize();
+    if (primaryOffset == 0) return kIOReturnUnformattedMedia;
+
+    // write the primary meta data to disk
+    primaryBuffer->setDirection(kIODirectionOut);
+    IOReturn rc = getTarget()->write(this, primaryOffset, primaryBuffer);
+
+    // XXX if this fails we should change state or something?
+        
+    IOLog1("AppleRAIDMember::writePrimaryMetaData(%p): finished rc = %x.\n", this, rc);
+    return rc;
+}
 
 
 //***************************************************************************************************************
@@ -721,6 +837,12 @@ const OSString * AppleRAIDMember::getDiskName(void)
     return OSDynamicCast(OSString, arTarget->getProperty(kIOBSDNameKey));
 }
 
+void AppleRAIDMember::setMemberIndex(UInt32 index)
+{
+    arMemberIndex = index;
+    setHeaderProperty(kAppleRAIDMemberIndexKey, index, 32);
+}
+
 //***************************************************************************************************************
 //***************************************************************************************************************
 //***************************************************************************************************************
@@ -756,10 +878,31 @@ UInt64 AppleRAIDMember::getSize() const
     return arTarget->getSize();
 }
 
-UInt32 AppleRAIDMember::getMemberIndex(void)
+UInt64 AppleRAIDMember::getUsableSize() const
 {
-    OSNumber * number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDMemberIndexKey));
-    return number ? number->unsigned32BitValue() : 0xffffffff;
+    OSNumber * number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDChunkCountKey));
+    if (!number) return 0;
+    UInt64 usable = number->unsigned64BitValue();
+
+    number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDChunkSizeKey));
+    if (!number) return 0;
+    usable *= number->unsigned64BitValue();
+
+    return usable;
+}
+
+UInt64 AppleRAIDMember::getPrimaryMaxSize() const
+{
+    UInt64 primaryOffset = getUsableSize();
+    if (primaryOffset == 0) return 0;
+
+    return arHeaderOffset - primaryOffset;
+}
+
+UInt64 AppleRAIDMember::getSecondarySize() const
+{
+    OSNumber * number = OSDynamicCast(OSNumber, getHeaderProperty(kAppleRAIDSecondaryMetaDataSizeKey));
+    return number ? number->unsigned64BitValue() : 0;
 }
 
 //***************************************************************************************************************
@@ -774,11 +917,6 @@ bool AppleRAIDMember::isEjectable() const
 bool AppleRAIDMember::isWritable() const
 {
     return arIsWritable;
-}
-
-UInt64 AppleRAIDMember::getPreferredBlockSize() const
-{
-    return arNativeBlockSize;
 }
 
 UInt64 AppleRAIDMember::getBase() const
@@ -840,10 +978,16 @@ OSDictionary * AppleRAIDMember::getMemberProperties(void)
     props->setObject(kAppleRAIDChunkCountKey, getHeaderProperty(kAppleRAIDChunkCountKey));
     props->setObject(kAppleRAIDMemberTypeKey, getHeaderProperty(kAppleRAIDMemberTypeKey));
 
+    props->setObject(kAppleRAIDSecondaryMetaDataSizeKey, getHeaderProperty(kAppleRAIDSecondaryMetaDataSizeKey));
+
     props->setObject(kAppleRAIDMemberStatusKey, getProperty(kAppleRAIDMemberStatusKey));
     props->setObject(kAppleRAIDRebuildStatus, getProperty(kAppleRAIDRebuildStatus));
 
     props->setObject(kIOBSDNameKey, getDiskName());
+
+    if (isRAIDSet()) {
+	props->setObject(kAppleRAIDSetUUIDKey, getHeaderProperty(kAppleRAIDSetUUIDKey));
+    }
 
     // broken members get spared, but we really want them to look broken here
     // scan to see if this members UUID matches in the member list
@@ -898,12 +1042,12 @@ bool AppleRAIDMember::changeMemberState(UInt32 newState, bool force)
         
     case kAppleRAIDMemberStateClosed : // 2
 	swapState = arMemberState >= kAppleRAIDMemberStateClosing;
-	newStatus = kAppleRAIDStatusOffline;
+	newStatus = kAppleRAIDStatusOnline;
 	break;
 
     case kAppleRAIDMemberStateClosing : // 3
 	swapState = arMemberState >= kAppleRAIDMemberStateClosing;
-	newStatus = kAppleRAIDStatusOffline;
+	newStatus = kAppleRAIDStatusOnline;
 	break;
         
     case kAppleRAIDMemberStateRebuilding : // 4
@@ -920,16 +1064,16 @@ bool AppleRAIDMember::changeMemberState(UInt32 newState, bool force)
     
     if (swapState) {
 
-	IOLog2("AppleRAIDMember::changeMemberState(%p) from %lu (%s) to %lu (%s).\n",
-	       this, arMemberState, oldStatus, newState, newStatus);
+	IOLog2("AppleRAIDMember::changeMemberState(%p) from %lu (%s) to %lu (%s) isSet = %s.\n",
+	       this, arMemberState, oldStatus, newState, newStatus, isRAIDSet() ? "yes":"no");
 	arMemberState = newState;
 
     } else {
 
 #ifdef DEBUG
 	if (arMemberState != newState) {
-	    IOLog1("AppleRAIDMember::changeMemberState(%p) %s from %lu (%s) to %lu (%s).\n",
-		   this, force ? "FORCED" : "FAILED", arMemberState, oldStatus, newState, newStatus);
+	    IOLog1("AppleRAIDMember::changeMemberState(%p) %s from %lu (%s) to %lu (%s) isSet = %s.\n",
+		   this, force ? "FORCED" : "FAILED", arMemberState, oldStatus, newState, newStatus, isRAIDSet() ? "yes":"no");
 	}
 #endif
 	if (force) arMemberState = newState;
